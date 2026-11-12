@@ -26,6 +26,8 @@ JPEG_QUALITIES = (85, 75, 65, 55)
 ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
 # 추론형 모델이라 작게 잡으면 응답이 중간에 끊긴다.
 MAX_TOKENS = 2000
+# 추론을 끈다. 켜 두면 물건이 많은 사진에서 추론이 MAX_TOKENS 를 다 써서 내용 없이 잘린다(2026-11-12 확인).
+EXTRA = {"reasoning": {"enabled": False}}
 # 재시도·시간 제한은 llm.py 가 정한다(429·5xx 는 한 번만 더 시도하고 그래도 안 되면 다음 모델).
 TIMEOUT_SEC = llm.TIMEOUT_SEC
 RETRY_DELAYS = llm.RETRY_DELAYS
@@ -138,7 +140,7 @@ def call_model(jpeg_bytes, api_key, model=VISION_MODEL, post=requests.post, slee
             ],
         }
     ]
-    return llm.chat(model, messages, api_key, MAX_TOKENS, post=post, sleep=sleep, on_event=on_event)
+    return llm.chat(model, messages, api_key, MAX_TOKENS, post=post, sleep=sleep, on_event=on_event, extra=EXTRA)
 
 
 def _recognize_with_model(jpeg, api_key, model, post, sleep, on_event=None):
@@ -150,6 +152,9 @@ def _recognize_with_model(jpeg, api_key, model, post, sleep, on_event=None):
         try:
             text = call_model(jpeg, api_key, model=model, post=post, sleep=sleep, on_event=on_event)
             return parse_ingredients(text)
+        except llm.TruncatedError as e:
+            last_error = e
+            break  # 잘림은 다시 물어도 똑같이 잘린다. 한도를 아끼려고 바로 대체 모델로 넘긴다.
         except ParseError as e:
             last_error = e
     raise ParseError("모델 응답을 해석하지 못했습니다. 다시 시도해 주세요.") from last_error
@@ -167,8 +172,10 @@ def recognize_detailed(raw_image, api_key, post=requests.post, sleep=time.sleep,
     jpeg = prepare_image(raw_image)
     llm.notify(on_event, "resize", original_bytes=len(raw_image), sent_bytes=len(jpeg))
     models = (VISION_MODEL, *FALLBACK_MODELS)
+    # 형식 오류·잘림도 대체 모델로 넘긴다(다른 모델은 제대로 답할 수 있다).
     model, items = llm.run_with_fallback(
-        models, lambda m: _recognize_with_model(jpeg, api_key, m, post, sleep, on_event), on_event
+        models, lambda m: _recognize_with_model(jpeg, api_key, m, post, sleep, on_event), on_event,
+        fall_on=(RateLimitedError, ModelUnavailableError, ParseError),
     )
     llm.notify(on_event, "done", model=model, count=len(items))
     return {"items": items, "model": model, "original_bytes": len(raw_image), "sent_bytes": len(jpeg)}

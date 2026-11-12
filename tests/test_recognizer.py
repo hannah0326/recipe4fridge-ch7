@@ -192,10 +192,48 @@ def test_recognize_retries_once_on_bad_format():
     assert len(post.calls) == 2
 
 
-def test_recognize_fails_after_second_bad_format():
-    post = FakePost([FakeResponse(200, "엉망"), FakeResponse(200, "또 엉망")])
+def test_recognize_fails_when_every_model_answers_badly_twice():
+    post = FakePost([FakeResponse(200, "엉망")] * (2 * (1 + len(rec.FALLBACK_MODELS))))
     with pytest.raises(rec.ParseError):
         rec.recognize(make_image(), "K", post=post, sleep=lambda s: None)
+
+
+def test_bad_format_twice_falls_back_to_next_model():
+    # 기본 모델이 두 번 다 형식에 어긋나게 답하면 대체 모델로 넘어간다(전에는 여기서 실패로 끝났다).
+    post = FakePost([FakeResponse(200, "엉망"), FakeResponse(200, "또 엉망"), FakeResponse(200, GOOD)])
+    result = rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None)
+    assert models_used(post) == [rec.VISION_MODEL, rec.VISION_MODEL, rec.FALLBACK_MODELS[0]]
+    assert result["model"] == rec.FALLBACK_MODELS[0]
+
+
+class TruncatedResponse:
+    """추론에 max_tokens 를 다 써서 내용 없이 잘린 응답(물건이 많은 냉장고 사진에서 실제로 일어났다)."""
+
+    status_code = 200
+
+    def json(self):
+        return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+
+
+def test_call_model_turns_reasoning_off():
+    # 추론을 켜 두면 복잡한 사진에서 추론이 토큰을 다 써 버려 답이 비어 버린다.
+    post = FakePost([FakeResponse(200, GOOD)])
+    rec.call_model(b"x", "K", post=post, sleep=lambda s: None)
+    assert post.calls[0]["json"]["reasoning"] == {"enabled": False}
+
+
+def test_empty_truncated_answer_is_reported_as_truncation_not_empty():
+    with pytest.raises(rec.ParseError) as e:
+        rec.call_model(b"x", "K", post=FakePost([TruncatedResponse()]), sleep=lambda s: None)
+    assert "잘렸" in str(e.value)
+
+
+def test_truncated_answer_goes_straight_to_fallback_without_same_model_retry():
+    # 잘림은 같은 모델에 다시 물어도 똑같이 잘리므로 한도만 쓴다. 바로 대체 모델로 간다.
+    post = FakePost([TruncatedResponse(), FakeResponse(200, GOOD)])
+    result = rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None)
+    assert models_used(post) == [rec.VISION_MODEL, rec.FALLBACK_MODELS[0]]
+    assert result["items"][0]["name"] == "달걀"
 
 
 def models_used(post):

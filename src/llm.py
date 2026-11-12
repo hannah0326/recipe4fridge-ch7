@@ -37,6 +37,10 @@ class ParseError(ServiceError):
         self.snippet = snippet
 
 
+class TruncatedError(ParseError):
+    """응답이 max_tokens 에서 잘렸다. 같은 모델에 다시 물어도 똑같이 잘리므로 재요청하지 않는다."""
+
+
 class RateLimitedError(ServiceError):
     """요청이 몰려 429 등이 계속된 경우. 잠시 뒤에는 풀릴 수 있다."""
 
@@ -167,10 +171,11 @@ def chat(model, messages, api_key, max_tokens, post=requests.post, sleep=time.sl
                 content = choice["message"]["content"]
             except (ValueError, KeyError, IndexError, TypeError):
                 raise ParseError("모델 응답에 choices 가 없습니다.")
+            # 잘림을 먼저 본다. 추론이 토큰을 다 쓰면 내용이 비어 있어도 원인은 '빈 응답'이 아니라 '잘림'이다.
+            if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+                raise TruncatedError("응답이 최대 길이에서 잘렸습니다.", _snippet(content or ""))
             if not content:
                 raise ParseError("모델이 빈 응답을 보냈습니다.")
-            if isinstance(choice, dict) and choice.get("finish_reason") == "length":
-                raise ParseError("응답이 최대 길이에서 잘렸습니다.", _snippet(content))
             return content
         if status == 429:
             daily = _daily_limit(r, data)

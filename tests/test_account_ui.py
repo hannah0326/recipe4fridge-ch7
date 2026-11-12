@@ -327,6 +327,25 @@ def test_saving_the_same_recipe_again_says_it_is_already_saved(at, memory_repo):
     assert not [b for b in at.button if b.label == "💾 저장"]               # 이미 저장한 것은 단추가 없다
 
 
+def count_calls(monkeypatch, memory_repo, name):
+    calls = []
+    original = getattr(memory_repo, name)
+    monkeypatch.setattr(memory_repo, name, lambda *a, **k: calls.append(a) or original(*a, **k))
+    return calls
+
+
+def test_a_recipe_deleted_on_my_recipes_can_be_saved_again_on_the_main_page(at, memory_repo):
+    user = login_user(at, memory_repo)
+    prepare_results(at)
+    button(at, "💾 저장", key="save_0").click().run()
+    assert [b.key for b in at.button if b.label == "💾 저장"] == ["save_1"]
+    rid = memory_repo.list_recipes(user["id"])[0]["id"]
+    go(at, account_ui.MENU_MY)
+    button(at, "삭제 확인", key=f"mr_del_{rid}").click().run()
+    go(at, account_ui.MENU_MAIN)
+    assert [b.key for b in at.button if b.label == "💾 저장"] == ["save_0", "save_1"]   # 바로 '저장됨'이 풀린다
+
+
 def test_logged_out_save_asks_to_log_in_and_saves_right_after_logging_in(at, memory_repo):
     prepare_results(at)
     button(at, "💾 저장 (로그인 필요)", key="save_0").click().run()
@@ -398,6 +417,20 @@ def test_my_recipes_search_and_filters(at, memory_repo):
     at.selectbox(key="mr_diff").set_value(None).run()
     at.text_input(key="mr_query").set_value("없는 요리").run()
     assert any("조건에 맞는 저장한 레시피가 없어요" in w.value for w in at.warning)
+
+
+def test_my_recipes_reads_the_storage_once_per_screen(at, memory_repo, monkeypatch):
+    me = login_user(at, memory_repo)
+    seed(memory_repo, me, "달걀 볶음", "양배추 전", "두부 조림")
+    listed = count_calls(monkeypatch, memory_repo, "list_recipes")
+    counted = count_calls(monkeypatch, memory_repo, "count_recipes")
+    go(at, account_ui.MENU_MY)
+    at.text_input(key="mr_query").set_value("양배추").run()
+    assert len(listed) == 2 and counted == []                           # 화면마다 한 번, 개수는 따로 묻지 않는다
+    assert all(c == (me["id"],) for c in listed)                        # 내 레시피만 묻는다
+    assert any("저장한 레시피 3개" in c.value for c in at.caption)        # 검색해도 전체 개수는 그대로다
+    titles = " ".join(m.value for m in at.markdown)
+    assert "양배추 전" in titles and "달걀 볶음" not in titles
 
 
 def test_my_recipes_empty_state(at, memory_repo):

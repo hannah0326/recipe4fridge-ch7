@@ -295,6 +295,8 @@ def apply_pending_save(user):
 
 
 def saved_fingerprints(repo, user):
+    # 화면을 다시 그릴 때마다 DB 에 묻는다. 세션에 기억해 두면 다른 탭·기기에서 바꾼 저장 상태가 늦게 반영되어
+    # 실제와 다른 '저장됨'이 보이므로, 질의 1회를 아끼는 것보다 정확한 표시를 택했다.
     if repo is None or user is None:
         return set()
     try:
@@ -370,11 +372,14 @@ def my_recipes_page(repo, repo_error, user):
                               format_func=lambda v: "전체" if v is None else DIFFICULTY_LABEL[v])
     _, min_minutes, max_minutes = next(c for c in TIME_CHOICES if c[0] == time_name)
     try:
-        total = repo.count_recipes(user["id"])
-        rows = repo.list_recipes(user["id"], query, min_minutes, max_minutes, difficulty)
+        # 위젯을 만질 때마다 다시 그려지므로 DB 왕복을 한 번으로 줄인다. 검색·필터는 원래도 받아 온 뒤 거르므로
+        # 전체 목록을 한 번 받아 개수를 세고 같은 규칙(filter_recipes)으로 거르면 결과가 같다. (질의는 user_id 로 제한된다)
+        all_rows = repo.list_recipes(user["id"])
     except db.StorageError as e:
         st.error(f"❌ 저장한 레시피를 불러오지 못했어요. {e}")
         return
+    total = len(all_rows)
+    rows = repository.filter_recipes(all_rows, query, min_minutes, max_minutes, difficulty)
     st.caption(f"저장한 레시피 {total}개 (최대 {repository.MAX_RECIPES_PER_USER}개)")
     if total == 0:
         st.info("아직 저장한 레시피가 없어요. '냉장고 레시피'에서 레시피를 만들고 💾 저장을 눌러 보세요.")

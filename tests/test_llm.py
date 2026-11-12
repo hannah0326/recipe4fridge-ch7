@@ -320,3 +320,36 @@ def test_extract_json_accepts_fences_and_prose(text):
 def test_extract_json_rejects_bad_text(bad):
     with pytest.raises(llm.ParseError):
         llm.extract_json(bad)
+
+
+
+# --- 5xx 는 요청 제한이 아니라 서버 오류로 안내한다 ---
+def test_server_errors_are_reported_as_server_problems_not_rate_limits():
+    post = FakePost([Resp(502), Resp(503)])
+    with pytest.raises(llm.ServerError) as e:
+        llm.chat("m", MESSAGES, "K", 10, post=post, sleep=lambda s: None)
+    assert str(e.value) == llm.MSG_SERVER and "몰려" not in str(e.value)
+    assert isinstance(e.value, llm.RateLimitedError)               # 대체 모델로 넘어가는 동작은 그대로다
+
+
+def test_repeated_429_is_still_a_busy_message():
+    with pytest.raises(llm.RateLimitedError) as e:
+        llm.chat("m", MESSAGES, "K", 10, post=FakePost([Resp(429), Resp(429)]), sleep=lambda s: None)
+    assert not isinstance(e.value, llm.ServerError) and str(e.value) == llm.MSG_BUSY
+
+
+def test_run_with_fallback_tells_server_errors_apart_from_rate_limits():
+    def all_server(m):
+        raise llm.ServerError(llm.MSG_SERVER)
+
+    events = []
+    with pytest.raises(llm.ServerError) as e:
+        llm.run_with_fallback(["a", "b"], all_server, events.append)
+    assert str(e.value) == llm.MSG_SERVER and [ev["reason"] for ev in events] == ["server", "server"]
+
+    def mixed(m):
+        raise llm.ServerError(llm.MSG_SERVER) if m == "a" else llm.RateLimitedError(llm.MSG_BUSY)
+
+    with pytest.raises(llm.RateLimitedError) as e:
+        llm.run_with_fallback(["a", "b"], mixed)
+    assert str(e.value) == llm.MSG_BUSY                              # 요청 제한이 섞였으면 요청 제한으로 안내한다

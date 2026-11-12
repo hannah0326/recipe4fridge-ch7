@@ -16,6 +16,8 @@ RETRY_DELAYS = (2,)
 KST = dt.timezone(dt.timedelta(hours=9))
 
 MSG_BUSY = "지금 요청이 몰려 있습니다. 잠시 후 다시 시도해 주세요."
+# 5xx 는 요청이 몰린 것이 아니라 AI 제공사 서버 쪽 문제다. 원인에 맞게 따로 안내한다.
+MSG_SERVER = "AI 서비스 서버에 일시적인 문제가 있어요. 잠시 후 다시 시도해 주세요."
 MSG_ALL_UNAVAILABLE = (
     "지금 이 서비스가 쓰는 AI 모델을 모두 사용할 수 없어요. 모델 서비스가 종료되었을 수 있습니다. "
     "시간이 지나도 같은 결과일 수 있으니 관리자에게 알려 주세요."
@@ -37,6 +39,10 @@ class ParseError(ServiceError):
 
 class RateLimitedError(ServiceError):
     """요청이 몰려 429 등이 계속된 경우. 잠시 뒤에는 풀릴 수 있다."""
+
+
+class ServerError(RateLimitedError):
+    """제공사 서버 오류(5xx)가 계속된 경우. 요청 제한과 같이 다시 시도·대체 모델로 넘어가되 안내 문구만 다르다."""
 
 
 def format_reset(reset_ms):
@@ -176,7 +182,7 @@ def chat(model, messages, api_key, max_tokens, post=requests.post, sleep=time.sl
                 notify(on_event, "retry", model=model, status=status, wait=RETRY_DELAYS[attempt])
                 sleep(RETRY_DELAYS[attempt])
                 continue
-            raise RateLimitedError(MSG_BUSY)
+            raise ServerError(MSG_SERVER) if status >= 500 else RateLimitedError(MSG_BUSY)
         if status == 401:
             # 키 설정 문제는 사용자에게 원인을 알리지 않는다. 같은 키라 다른 모델로 바꿔도 소용없다.
             # 키 값은 어디에도 남기지 않는다.
@@ -191,7 +197,8 @@ def run_with_fallback(models, attempt, on_event=None, fall_on=(RateLimitedError,
 
     성공하면 (사용한 모델, attempt 의 결과)를 돌려준다. 하루 한도 소진(DailyLimitError)과 401 같은 그 밖의 오류는
     모델을 바꿔도 소용없으므로 그대로 올린다. 모두 실패하면 원인에 맞는 오류를 낸다.
-    모두 사용 불가면 AllModelsUnavailableError, 모두 형식 오류면 ParseError, 그 밖에는 RateLimitedError 다.
+    모두 사용 불가면 AllModelsUnavailableError, 모두 형식 오류면 ParseError, 요청 제한(429) 없이 서버 오류(5xx)가 있었으면
+    ServerError, 그 밖에는 RateLimitedError 다.
     """
     errors = []
     for i, model in enumerate(models):
@@ -205,6 +212,8 @@ def run_with_fallback(models, attempt, on_event=None, fall_on=(RateLimitedError,
                 reason = "unavailable"
             elif isinstance(e, ParseError):
                 reason = "parse"
+            elif isinstance(e, ServerError):
+                reason = "server"
             else:
                 reason = "rate_limited"
             origin = e.__cause__ or e  # 형식 오류는 마지막 시도의 구체적인 원인을 함께 알린다
@@ -216,4 +225,7 @@ def run_with_fallback(models, attempt, on_event=None, fall_on=(RateLimitedError,
         raise AllModelsUnavailableError(MSG_ALL_UNAVAILABLE) from last
     if errors and all(isinstance(e, ParseError) for e in errors):
         raise ParseError(MSG_ALL_PARSE) from last
+    busy = any(isinstance(e, RateLimitedError) and not isinstance(e, ServerError) for e in errors)
+    if not busy and any(isinstance(e, ServerError) for e in errors):
+        raise ServerError(MSG_SERVER) from last
     raise RateLimitedError(MSG_BUSY) from last

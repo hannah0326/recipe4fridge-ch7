@@ -25,6 +25,10 @@ MAX_FAILURES = 5
 FAILURE_WINDOW_SEC = 15 * 60
 
 GENERIC_LOGIN_ERROR = "이메일 또는 비밀번호가 올바르지 않습니다."
+# 구글 계정 생성이 유일 제약에 걸린 경우. 같은 이메일 동시 가입이면 다시 시도로 풀리지만, 구글 계정의 대표 이메일을
+# 바꾼 사용자는 예전 이메일로 만든 계정과 구글 계정 번호(sub)가 겹쳐 계속 실패한다. 그 경우를 함께 안내한다.
+GOOGLE_CREATE_FAILED = ("구글 계정으로 계정을 만들지 못했어요. 다시 시도해도 같다면, 구글 계정의 이메일을 바꾸셔서 "
+                        "예전 이메일로 만든 계정이 남아 있을 수 있어요. 관리자에게 알려 주세요.")
 GOOGLE_ACCOUNT = "이 이메일은 구글 로그인으로 가입되어 있어요. '구글로 로그인'을 눌러 주세요."
 PASSWORD_ACCOUNT = "이 이메일은 이미 아이디·비밀번호로 가입되어 있어요. 아이디·비밀번호로 로그인해 주세요."
 
@@ -205,7 +209,7 @@ def login_with_google(repo, identity):
         try:
             user = repo.create_user(email, "google", name, google_sub=sub)
         except DuplicateEmailError:
-            raise AuthError("계정을 만드는 중 문제가 생겼어요. 다시 시도해 주세요.") from None
+            raise AuthError(GOOGLE_CREATE_FAILED) from None
         repo.touch_login(user["id"])
         return user
     if cred["provider"] == "password":

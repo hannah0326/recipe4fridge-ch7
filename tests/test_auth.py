@@ -330,3 +330,12 @@ def test_starting_a_session_purges_expired_ones(repo):
     now[0] += dt.timedelta(days=40)
     auth.start_session(repo, user["id"], now=now[0])
     assert auth.hash_token(old) not in repo.sessions and len(repo.sessions) == 1
+
+
+
+def test_google_account_whose_email_changed_gets_a_matching_explanation(repo):
+    auth.login_with_google(repo, identity(email="old@example.com", sub="sub-1"))
+    with pytest.raises(auth.AuthError) as e:                         # 같은 구글 계정(sub)이 새 이메일로 돌아온 경우
+        auth.login_with_google(repo, identity(email="new@example.com", sub="sub-1"))
+    assert str(e.value) == auth.GOOGLE_CREATE_FAILED and "이메일을 바꾸" in str(e.value)
+    assert len(repo.users) == 1

@@ -280,6 +280,9 @@ class MemoryRepository:
         self._check()
         if any(u["email"] == email for u in self.users.values()):
             raise DuplicateEmailError("이미 가입된 이메일입니다.")
+        # 실제 DB 의 google_sub unique 제약과 같게 한다(테스트가 구글 이메일 변경 상황을 재현할 수 있게).
+        if google_sub and any(u["google_sub"] == google_sub for u in self.users.values()):
+            raise DuplicateEmailError("이미 가입된 이메일입니다.")
         if provider not in PROVIDERS or (provider == "password" and not password_hash):
             raise ValueError("잘못된 계정 정보")
         self._user_seq += 1

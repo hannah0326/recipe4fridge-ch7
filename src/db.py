@@ -23,6 +23,16 @@ STORAGE_DOWN_MESSAGE = (
     "저장소(DB)에 연결하지 못했어요. 잠시 후 다시 시도해 주세요. "
     "로그인과 저장이 아닌 재료 인식과 레시피 추천은 그대로 쓸 수 있어요."
 )
+STORAGE_BUSY_MESSAGE = (
+    "저장소(DB)에 요청이 몰려 있어요. 잠시 후 다시 시도해 주세요. "
+    "로그인과 저장이 아닌 재료 인식과 레시피 추천은 그대로 쓸 수 있어요."
+)
+# 풀이 동시에 내줄 수 있는 연결 수. 이보다 많은 작업이 몰리면 바로 실패하지 않고 연결이 돌아올 때까지 기다린다.
+# (Supabase Session pooler 의 무료 연결 수를 넘지 않도록 크게 늘리지 않는다)
+POOL_MIN = 1
+POOL_MAX = 5
+# 연결이 모두 쓰이는 중일 때 기다리는 최대 시간(초). 넘으면 StorageBusyError 로 알린다.
+POOL_WAIT_SEC = 10
 # 이 시간(초)보다 오래 안 쓴 연결은 꺼낼 때 먼저 확인 쿼리를 보낸다.
 IDLE_CHECK_SEC = 30
 CONNECT_KWARGS = {
@@ -38,6 +48,10 @@ CONNECTION_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
 
 class StorageError(llm.ServiceError):
     """저장소를 쓸 수 없을 때. 메시지는 사용자에게 그대로 보여 줘도 되고, 접속 정보는 담지 않는다."""
+
+
+class StorageBusyError(StorageError):
+    """연결이 모두 쓰이는 중이라 기다려도 차례가 오지 않았다. 연결이 끊긴 것이 아니므로 풀을 새로 만들지 않는다."""
 
 
 def database_url(secret=None):
@@ -70,17 +84,21 @@ def redact(text, url):
 
 
 def _default_pool(url):
-    return psycopg2.pool.ThreadedConnectionPool(1, 5, url, **CONNECT_KWARGS)
+    return psycopg2.pool.ThreadedConnectionPool(POOL_MIN, POOL_MAX, url, **CONNECT_KWARGS)
 
 
 class Database:
     """연결 풀과 질의 실행. 모든 값은 파라미터로 바인딩하고, 연결이 끊겼으면 풀을 새로 만들어 한 번 다시 시도한다."""
 
-    def __init__(self, url, pool_factory=_default_pool, clock=time.monotonic):
+    def __init__(self, url, pool_factory=_default_pool, clock=time.monotonic, max_conn=POOL_MAX, wait_sec=POOL_WAIT_SEC):
         self.url = url
         self._pool_factory = pool_factory
         self._clock = clock
         self._lock = threading.Lock()
+        # 풀(ThreadedConnectionPool)은 연결이 모두 쓰이는 중이면 기다리지 않고 PoolError 를 낸다.
+        # 그래서 꺼내기 전에 이 세마포어로 자리를 먼저 잡아, 넘치는 작업은 연결이 돌아올 때까지 기다리게 한다.
+        self._slots = threading.BoundedSemaphore(max_conn)
+        self._wait_sec = wait_sec
         self._pool = None
         self._last_used = 0.0
         self.pool_resets = 0  # 풀을 새로 만든 횟수(점검·테스트용)
@@ -109,10 +127,33 @@ class Database:
                 old.closeall()
 
     def _checkout(self):
-        """살아 있는 연결을 꺼낸다. 오래 안 쓴 연결은 확인 쿼리를 보내고, 죽었으면 풀을 새로 만든다."""
+        """살아 있는 연결을 꺼낸다. 오래 안 쓴 연결은 확인 쿼리를 보내고, 죽었으면 풀을 새로 만든다.
+
+        먼저 연결 자리(세마포어)를 잡는다. 자리를 잡았으면 반드시 _release 나 여기서의 실패 처리로 돌려준다.
+        """
+        if not self._slots.acquire(timeout=self._wait_sec):
+            logger.warning("DB 연결 대기 시간 초과(%s초)", self._wait_sec)
+            raise StorageBusyError(STORAGE_BUSY_MESSAGE)
+        try:
+            return self._checkout_conn()
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def _checkout_conn(self):
+        pool_error = False
         for attempt in range(2):
             pool = self._get_pool()
-            conn = pool.getconn()
+            try:
+                conn = pool.getconn()
+            except psycopg2.pool.PoolError as e:
+                # 다른 작업이 풀을 새로 만들며 닫은 직후이거나(closed), 자리 계산이 어긋나 풀이 비었을 때(exhausted).
+                # 연결 오류가 아니므로 풀을 버리지 않고, 새 풀을 한 번 더 받아 본 뒤 그래도 안 되면 알린다.
+                # PoolError 문구에는 접속 정보가 없다("connection pool exhausted" 등).
+                logger.warning("DB 풀에서 연결을 받지 못함: %s", e)
+                pool_error = True
+                continue
+            pool_error = False
             idle = self._clock() - self._last_used
             if idle < IDLE_CHECK_SEC and not conn.closed:
                 return pool, conn
@@ -125,12 +166,17 @@ class Database:
                 with contextlib.suppress(Exception):
                     pool.putconn(conn, close=True)
                 self.reset_pool()
+        if pool_error:
+            raise StorageBusyError(STORAGE_BUSY_MESSAGE)
         raise StorageError(STORAGE_DOWN_MESSAGE)
 
     def _release(self, pool, conn, broken=False):
         self._last_used = self._clock()
-        with contextlib.suppress(Exception):
-            pool.putconn(conn, close=broken)
+        try:
+            with contextlib.suppress(Exception):
+                pool.putconn(conn, close=broken)
+        finally:
+            self._slots.release()
 
     # --- 실행 ---
     @contextlib.contextmanager
@@ -173,6 +219,8 @@ class Database:
                         row = cur.fetchone()
                         return dict(row) if row else None
                     return None
+            except StorageBusyError:
+                raise  # 연결이 끊긴 것이 아니라 붐비는 것이다. 이미 기다렸으므로 다시 기다리지 않는다
             except StorageError:
                 if attempt == 1:
                     raise

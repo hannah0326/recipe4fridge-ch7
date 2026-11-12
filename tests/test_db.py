@@ -2,6 +2,7 @@
 # DB 접속 계층 테스트. 실제 DB 없이 가짜 연결·풀로, 앱이 잠들었다 깨어난 뒤 죽은 연결을 만났을 때의 복구와
 # 접속 정보가 오류 문구에 새지 않는지를 확인한다.
 import psycopg2
+import psycopg2.pool
 import psycopg2.errors
 import pytest
 
@@ -204,3 +205,92 @@ def test_close_closes_the_pool_once():
     database.close()
     database.close()
     assert pool.closed_all is True
+
+
+# --- 연결 풀 소진(동시 작업이 풀 크기를 넘을 때) ------------------------------------------
+class LimitedPool:
+    """ThreadedConnectionPool 처럼 max 개를 넘게 내주려 하면 기다리지 않고 PoolError 를 내는 가짜 풀."""
+
+    def __init__(self, size, hold=0.0):
+        import threading
+        self.size, self.hold, self.used, self.peak, self._lock = size, hold, 0, 0, threading.Lock()
+        self.closed_all = False
+
+    def getconn(self):
+        with self._lock:
+            if self.used >= self.size:
+                raise psycopg2.pool.PoolError("connection pool exhausted")
+            self.used += 1
+            self.peak = max(self.peak, self.used)
+        pool = self
+
+        class SlowConn(FakeConn):
+            def commit(self):
+                import time
+                time.sleep(pool.hold)  # 질의가 연결을 잠깐 붙잡고 있는 것을 흉내 낸다
+                super().commit()
+
+        return SlowConn()
+
+    def putconn(self, conn, close=False):
+        with self._lock:
+            self.used -= 1
+
+    def closeall(self):
+        self.closed_all = True
+
+
+def test_more_concurrent_queries_than_the_pool_size_wait_their_turn_instead_of_failing():
+    import threading
+    pool = LimitedPool(size=3, hold=0.05)
+    database = db.Database(URL, pool_factory=lambda url: pool, clock=lambda: 0.0, max_conn=3, wait_sec=5)
+    errors = []
+
+    def work():
+        try:
+            database.run("select 1")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=work) for _ in range(9)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and pool.peak <= 3 and pool.used == 0           # 모두 성공했고 연결을 모두 돌려줬다
+    assert database.pool_resets == 0
+
+
+def test_waiting_too_long_for_a_connection_is_a_storage_error_not_a_raw_pool_error():
+    pool = LimitedPool(size=1)
+    database = db.Database(URL, pool_factory=lambda url: pool, clock=lambda: 0.0, max_conn=1, wait_sec=0.05)
+    with database.transaction():                                          # 하나뿐인 연결을 붙잡고 있는 동안
+        with pytest.raises(db.StorageError) as e:
+            database.run("select 1")
+    assert isinstance(e.value, db.StorageBusyError) and str(e.value) == db.STORAGE_BUSY_MESSAGE
+    assert database.pool_resets == 0                                      # 붐비는 것은 끊긴 것이 아니므로 풀을 버리지 않는다
+    assert database.run("select 1") == [{"n": 1}, {"n": 2}]               # 연결이 돌아오면 다시 쓸 수 있다
+
+
+def test_a_pool_error_from_the_pool_itself_becomes_a_storage_error():
+    class ExhaustedPool(FakePool):
+        def getconn(self):
+            raise psycopg2.pool.PoolError("connection pool exhausted")
+
+    database, _ = make_db(ExhaustedPool([]), ExhaustedPool([]))
+    with pytest.raises(db.StorageBusyError):
+        database.run("select 1")
+    assert database._slots.acquire(blocking=False)         # 실패해도 연결 자리를 돌려줬다
+
+
+def test_connection_slots_are_given_back_after_errors():
+    conn = FakeConn(raise_on=lambda q: psycopg2.errors.UniqueViolation("duplicate key") if "insert" in q else None)
+    database = db.Database(URL, pool_factory=lambda url: FakePool([conn]), clock=lambda: 0.0, max_conn=1, wait_sec=0.05)
+    for _ in range(3):                                                    # 자리를 돌려주지 않으면 두 번째부터 기다리다 실패한다
+        with pytest.raises(psycopg2.errors.UniqueViolation):
+            database.run("insert into x values (1)")
+    dead = db.Database(URL, pool_factory=lambda url: FakePool([FakeConn(dead=True)]), clock=lambda: 0.0, max_conn=1, wait_sec=0.05)
+    for _ in range(2):
+        with pytest.raises(db.StorageError) as e:
+            dead.run("select 1")
+        assert not isinstance(e.value, db.StorageBusyError)               # 끊긴 연결은 '붐빔'이 아니라 '연결 실패'로 알린다

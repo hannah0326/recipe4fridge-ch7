@@ -162,6 +162,77 @@ def test_failures_of_one_email_do_not_lock_another(repo):
     assert auth.login(repo, "b@example.com", PW, limiter)["email"] == "b@example.com"
 
 
+def test_old_failure_records_are_dropped_so_memory_does_not_grow(repo):
+    now = [1000.0]
+    limiter = auth.LoginLimiter(max_failures=5, window_sec=600, clock=lambda: now[0])
+    for i in range(500):                                             # 아무 이메일로나 한 번씩 실패(argon2 를 피하려고 제한기만 쓴다)
+        limiter.begin(f"nobody{i}@example.com")
+        limiter.end(f"nobody{i}@example.com", "fail")
+    assert len(limiter._failures) == 500
+    now[0] += 601                                                    # 창 시간이 지난 뒤 다음 시도에서 한꺼번에 정리한다
+    with pytest.raises(auth.AuthError):
+        auth.login(repo, "someone@example.com", PW, limiter)
+    assert list(limiter._failures) == ["someone@example.com"] and limiter._pending == {}
+
+
+def test_a_lock_still_counts_failures_inside_the_window_after_a_sweep(repo):
+    now = [1000.0]
+    limiter = auth.LoginLimiter(max_failures=2, window_sec=600, clock=lambda: now[0])
+    auth.register(repo, "a@example.com", PW)
+    now[0] += 590
+    for _ in range(2):
+        with pytest.raises(auth.AuthError):
+            auth.login(repo, "a@example.com", "wrong-password", limiter)
+    now[0] += 20                                                     # 정리가 돌 시점이지만 이 기록은 아직 창 안이다
+    with pytest.raises(auth.AuthError) as locked:
+        auth.login(repo, "a@example.com", PW, limiter)
+    assert "연달아 실패" in str(locked.value)
+
+
+def test_concurrent_attempts_cannot_get_more_password_checks_than_the_limit(repo, monkeypatch):
+    import threading
+    auth.register(repo, "a@example.com", PW)
+    limiter = auth.LoginLimiter(max_failures=3, window_sec=600)
+    checks, gate = [], threading.Event()
+
+    def slow_verify(h, p):                                           # 비밀번호 확인이 도는 동안 다른 시도가 몰려온다
+        checks.append(p)
+        gate.wait(2)
+        return False
+
+    monkeypatch.setattr(auth, "verify_password", slow_verify)
+    results = []
+
+    def attempt():
+        try:
+            auth.login(repo, "a@example.com", "wrong-password", limiter)
+        except auth.AuthError as e:
+            results.append(str(e))
+
+    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for _ in range(200):                                             # 한도만큼 확인에 들어가고 나머지는 막혔을 때까지 기다린다
+        if len(checks) >= 3 and len(results) >= 5:
+            break
+        threading.Event().wait(0.01)
+    gate.set()
+    for t in threads:
+        t.join()
+    assert len(checks) == 3                                          # 동시에 8번 시도해도 한도(3)만큼만 비밀번호를 확인했다
+    assert sum("연달아 실패" in r for r in results) == 5 and limiter._pending == {}
+
+
+def test_an_attempt_that_is_not_a_password_failure_does_not_count(repo):
+    limiter = auth.LoginLimiter(max_failures=1, window_sec=600)
+    repo.create_user("g@example.com", "google", "구글", google_sub="s")
+    for _ in range(3):                                               # 구글 계정 안내는 실패로 세지 않는다(이전과 같음)
+        with pytest.raises(auth.AuthError) as e:
+            auth.login(repo, "g@example.com", PW, limiter)
+        assert str(e.value) == auth.GOOGLE_ACCOUNT
+    assert limiter._pending == {} and limiter._failures == {}
+
+
 # --- 구글 로그인 ---------------------------------------------------------------------------
 def identity(**kw):
     base = {"email": "G@Example.com", "name": "구글 한나", "sub": "sub-1", "email_verified": True}

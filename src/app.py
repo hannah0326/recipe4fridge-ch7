@@ -81,14 +81,17 @@ def describe_event(event):
     if kind == "response":
         return f"↳ {event['status']} 응답 ({event['seconds']}초)"
     if kind == "retry":
-        return f"⏳ HTTP {event['status']} 요청 제한 — {event['wait']}초 뒤 다시 시도"
+        # 429 는 요청 제한, 5xx 는 제공사 서버 오류다. 원인을 섞어 부르지 않는다.
+        what = "요청 제한" if event["status"] == 429 else "서버 오류"
+        return f"⏳ HTTP {event['status']} {what} — {event['wait']}초 뒤 다시 시도"
     if kind == "parse_retry":
         return f"🔁 {event['model']} 응답 형식 오류 — 다시 요청 (원인: {cause_text(event)})"
     if kind == "daily_limit":
         return (f"⛔ 하루 무료 호출 한도를 모두 썼어요 — 다른 모델도 같은 한도를 쓰므로 더 시도하지 않습니다 "
                 f"({event['reset']}에 초기화)")
     if kind == "fallback":
-        reason = {"unavailable": "사용 불가", "parse": f"응답 형식 오류가 계속됨 (원인: {cause_text(event)})"}.get(
+        reason = {"unavailable": "사용 불가", "server": "서버 오류가 계속됨",
+                  "parse": f"응답 형식 오류가 계속됨 (원인: {cause_text(event)})"}.get(
             event.get("reason"), "요청 제한이 계속됨"
         )
         nxt = event["next_model"]
@@ -96,7 +99,8 @@ def describe_event(event):
     if kind == "round":
         return f"🍳 레시피 {event['need']}개 요청 ({event['round']}번째)" if event["round"] > 1 else f"🍳 레시피 {event['need']}개 요청"
     if kind == "excluded":
-        return f"🚫 '{event['title']}' 제외: {event['reason']}"
+        # 제목은 모델이 만든 글자라서 이스케이프한다(링크·서식으로 그려지지 않게).
+        return f"🚫 '{md_safe(event['title'])}' 제외: {md_safe(event['reason'])}"
     if kind == "done":
         return f"✅ {event['model']} {event.get('what', '인식')} 완료 ({event['count']}개)"
     return str(event)
@@ -124,19 +128,67 @@ def clear_recipes():
         st.session_state.pop(key, None)
 
 
-def recipe_options():
-    """레시피 조건 입력 위젯을 그리고 선택값을 돌려준다. 로그인했으면 프로필 값이 기본값으로 채워진다."""
-    account_ui.apply_profile_defaults(st.session_state.get("user"))
+# 레시피 조건 위젯의 key. 다른 메뉴(로그인·프로필 등)로 가면 Streamlit 이 이 값들을 지우므로 OPTION_STORE 에 되써 둔다.
+OPTION_KEYS = ("opt_cuisine", "opt_difficulty", "opt_time", "opt_servings", "opt_allergies", "opt_diet", "opt_extra", "opt_count")
+OPTION_STORE = account_ui.OPTION_STORE
+# 위젯에 value·index 를 주지 않고 상태에 기본값을 넣는다(둘 다 주면 Streamlit 이 경고를 띄운다).
+ANY = "제한 없음"  # 요리 종류·난이도를 고르지 않음
+OPTION_DEFAULTS = {"opt_servings": 2, "opt_extra": recipe.EXTRA_CHOICES[1], "opt_count": 3}
+
+
+def restore_options(user):
+    """메뉴를 오가느라 지워진 레시피 조건을 되살린다.
+
+    로그인하기 전에 고른 조건이면, 로그인한 사람 프로필의 알레르기·식단 제한을 더한다(직접 넣은 값은 빼지 않는다).
+    알레르기 조건이 말없이 사라지거나 바뀌면 안 되기 때문이다.
+    """
     ss = st.session_state
-    st.selectbox("요리 종류", [None, *recipe.CUISINES], format_func=lambda v: "제한 없음" if v is None else v, key="opt_cuisine")
+    # 다른 메뉴에 다녀오면 서버에는 값이 남아 있어도, 새로 그려진 위젯은 그 값을 받지 못하고 위젯 기본값(1, 빈 목록,
+    # 첫 선택지)을 보인다. 화면과 실제 조건이 어긋나 알레르기가 빠진 것처럼 보이므로, 값을 상태에 다시 넣어
+    # Streamlit 이 위젯에 보내게 한다(Streamlit 문서의 위젯 상태 유지 방법).
+    for key in OPTION_KEYS:
+        if key in ss:
+            ss[key] = ss[key]
+    store = ss.get(OPTION_STORE)
+    if not store:
+        return
+    for key, value in store["values"].items():
+        if key not in ss:
+            ss[key] = list(value) if isinstance(value, list) else value
+    if user and store.get("user_id") != user["id"]:
+        for key, field in (("opt_allergies", "allergies"), ("opt_diet", "diet_restrictions")):
+            ss[key] = list(dict.fromkeys([*ss.get(key, []), *user[field]]))
+
+
+def remember_options(user):
+    ss = st.session_state
+    ss[OPTION_STORE] = {"user_id": user["id"] if user else None,
+                        "values": {k: (list(ss[k]) if isinstance(ss[k], list) else ss[k]) for k in OPTION_KEYS if k in ss}}
+
+
+def recipe_options():
+    """레시피 조건 입력 위젯을 그리고 선택값을 돌려준다. 로그인했으면 프로필 값이 기본값으로 채워진다.
+
+    메뉴를 오가도 고른 조건은 유지된다(restore_options). 처음이면 프로필 값, 그것도 없으면 OPTION_DEFAULTS 를 쓴다.
+    """
+    user = st.session_state.get("user")
+    restore_options(user)
+    account_ui.apply_profile_defaults(user)
+    ss = st.session_state
+    for key, value in OPTION_DEFAULTS.items():
+        ss.setdefault(key, value)
+    # 선택지에 None 을 두면 상태로 값을 다시 넣을 때 위젯이 '선택 안 함'(Choose an option)으로 그려진다.
+    # 그래서 "제한 없음" 글자를 값으로 쓰고, 조건으로 넘길 때만 None 으로 바꾼다.
+    for key in ("opt_cuisine", "opt_difficulty"):
+        if ss.get(key, ANY) is None:
+            ss[key] = ANY
+    st.selectbox("요리 종류", [ANY, *recipe.CUISINES], key="opt_cuisine")
     st.selectbox(
-        "난이도", [None, *recipe.DIFFICULTIES],
-        format_func=lambda v: "제한 없음" if v is None else DIFFICULTY_LABEL[v], key="opt_difficulty",
+        "난이도", [ANY, *recipe.DIFFICULTIES],
+        format_func=lambda v: v if v == ANY else DIFFICULTY_LABEL[v], key="opt_difficulty",
     )
     st.selectbox("조리 시간", [c[0] for c in TIME_CHOICES], key="opt_time")
-    # 프로필 값을 상태에 미리 넣어 둔 위젯에는 value 를 함께 주지 않는다(Streamlit 이 둘 다 주면 경고한다).
-    number_kwargs = {} if "opt_servings" in ss else {"value": 2}
-    st.number_input("인원수", min_value=1, max_value=10, step=1, key="opt_servings", **number_kwargs)
+    st.number_input("인원수", min_value=1, max_value=10, step=1, key="opt_servings")
     st.multiselect(
         "알레르기", list(dict.fromkeys([*recipe.ALLERGEN_TERMS, *ss.get("opt_allergies", [])])),
         accept_new_options=True, key="opt_allergies", placeholder="없음 (직접 입력도 가능)",
@@ -146,14 +198,15 @@ def recipe_options():
         accept_new_options=True, key="opt_diet", placeholder="없음",
     )
     st.radio(
-        "추가 재료 사용", recipe.EXTRA_CHOICES, index=1, horizontal=True, key="opt_extra",
+        "추가 재료 사용", recipe.EXTRA_CHOICES, horizontal=True, key="opt_extra",
         help="불가: 가진 재료만 / 소량: 소금·간장 같은 기본 양념류만 / 허용: 자유롭게",
     )
-    st.slider("추천 개수", 1, 5, 3, key="opt_count")
+    st.slider("추천 개수", 1, 5, key="opt_count")
+    remember_options(user)
     _, min_minutes, max_minutes = next(c for c in TIME_CHOICES if c[0] == st.session_state["opt_time"])
     return {
-        "cuisine": st.session_state["opt_cuisine"],
-        "difficulty": st.session_state["opt_difficulty"],
+        "cuisine": None if st.session_state["opt_cuisine"] == ANY else st.session_state["opt_cuisine"],
+        "difficulty": None if st.session_state["opt_difficulty"] == ANY else st.session_state["opt_difficulty"],
         "servings": st.session_state["opt_servings"],
         "min_minutes": min_minutes,
         "max_minutes": max_minutes,
@@ -280,6 +333,8 @@ if st.button("식재료 인식", type="primary", disabled=source is None):
     st.session_state.pop("rows", None)
     st.session_state.pop("run_info", None)
     st.session_state.pop("recognize_error", None)
+    # 이전 진행 기록도 지운다. 요청 제한에 걸려 새 기록이 생기지 않을 때 직전 성공 기록이 이번 시도처럼 보이면 안 된다.
+    st.session_state.pop("progress_log", None)
     clear_recipes()
     if rate_limited():
         st.session_state["recognize_error"] = TOO_OFTEN
@@ -365,6 +420,6 @@ if "rows" in st.session_state:
             st.warning("재료가 하나도 없습니다. 한 개 이상 입력해 주세요.")
 
 if "confirmed" in st.session_state:
-    names = ", ".join(i["name"] for i in st.session_state["confirmed"])
+    names = ", ".join(md_safe(i["name"]) for i in st.session_state["confirmed"])  # 모델 인식 결과라 이스케이프
     st.success(f"확정됨: {names}")
     recipe_section(st.session_state["confirmed"])

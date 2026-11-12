@@ -58,7 +58,7 @@ def test_options_and_safety_notice_are_shown(app):
     assert not app.exception
     assert [n.label for n in app.number_input] == ["인원수"]
     assert [s.label for s in app.selectbox] == ["요리 종류", "난이도", "조리 시간"]
-    assert [s.value for s in app.selectbox] == [None, None, "제한 없음"]      # 기본은 모두 제한 없음
+    assert [s.value for s in app.selectbox] == ["제한 없음", "제한 없음", "제한 없음"]   # 기본은 모두 제한 없음
     assert app.selectbox[2].options == ["제한 없음", "15분 이내", "30분 이내", "30분 이상"]   # 60분 이내는 없다
     assert [m.label for m in app.multiselect] == ["알레르기", "식단 제한"]
     assert app.radio[0].value == "소량" and app.slider[0].value == 3
@@ -88,6 +88,21 @@ def test_generate_passes_chosen_options_and_shows_cards(app, monkeypatch):
     t = texts(app)
     assert "1. 달걀 볶음" in t and "2. 양배추 국" in t and "부족한 재료 1개" in t and "대파" in t
     assert button(app, "다시 생성")              # 결과가 있으면 단추 이름이 바뀐다
+
+
+def test_unrestricted_cuisine_and_difficulty_reach_the_generator_as_none(app, monkeypatch):
+    # 화면에는 "제한 없음" 글자를 값으로 쓰지만, 레시피 생성에는 None(제한 없음)으로 넘겨야 한다.
+    seen = {}
+
+    def fake(ingredients, options, key, on_event=None, **kw):
+        seen["options"] = options
+        return fake_result()
+
+    monkeypatch.setattr(recipe, "generate_recipes", fake)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    assert not app.exception
+    assert (seen["options"]["cuisine"], seen["options"]["difficulty"]) == (None, None)
 
 
 def test_cuisine_difficulty_and_time_choices_reach_the_generator(app, monkeypatch):
@@ -340,3 +355,61 @@ def test_a_new_successful_recognition_clears_the_old_failure_message(photo_app, 
     [b for b in photo_app.button if b.label == "식재료 인식"][0].click().run()
     assert not photo_app.error                                 # 성공하면 지난 실패 표시는 사라진다
     assert photo_app.session_state["rows"][0]["name"] == "달걀"
+
+
+
+# --- 사용자 경험: 원인에 맞는 문구·이스케이프·진행 기록 ---
+def test_retry_and_fallback_lines_name_the_right_cause(app, monkeypatch):
+    def fake(ingredients, options, key, on_event=None, **kw):
+        on_event({"kind": "retry", "model": "m/a", "status": 429, "wait": 2})
+        on_event({"kind": "retry", "model": "m/a", "status": 503, "wait": 2})
+        on_event({"kind": "fallback", "model": "m/a", "reason": "server", "next_model": "m/b"})
+        return fake_result()
+
+    monkeypatch.setattr(recipe, "generate_recipes", fake)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    log = app.session_state["recipe_log"]
+    assert "⏳ HTTP 429 요청 제한 — 2초 뒤 다시 시도" in log
+    assert "⏳ HTTP 503 서버 오류 — 2초 뒤 다시 시도" in log
+    assert any("서버 오류가 계속됨" in line for line in log)
+
+
+def test_excluded_titles_in_the_progress_log_are_escaped(app, monkeypatch):
+    def fake(ingredients, options, key, on_event=None, **kw):
+        on_event({"kind": "excluded", "title": "[쿠폰](http://evil.example)", "reason": "시간"})
+        return fake_result()
+
+    monkeypatch.setattr(recipe, "generate_recipes", fake)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    line = [x for x in app.session_state["recipe_log"] if x.startswith("🚫")][0]
+    assert "[쿠폰](http" not in line and r"\[쿠폰\]" in line
+
+
+def test_confirmed_ingredient_names_are_escaped():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["confirmed"] = [{"name": "[클릭](http://evil.example)", "quantity": "", "confidence": "high"}]
+    at.run()
+    shown = " ".join(s.value for s in at.success)
+    assert "확정됨" in shown and "[클릭](http" not in shown and r"\[클릭\]" in shown
+
+
+def test_rate_limited_recognition_does_not_show_the_previous_progress_log(photo_app, monkeypatch):
+    import time as _t
+    monkeypatch.setattr(recognizer, "recognize_detailed", lambda *a, **k: None)
+    photo_app.session_state["progress_log"] = ["✅ m/a 인식 완료 (3개)"]   # 직전에 성공한 기록
+    photo_app.session_state["calls"] = [_t.time()] * 5
+    photo_app.run()
+    recognize_click(photo_app)
+    assert any("너무 잦습니다" in e.value for e in photo_app.error)
+    assert "progress_log" not in photo_app.session_state
+    assert not [ex for ex in photo_app.expander if ex.label == "진행 기록"]
+
+
+def test_recipe_card_does_not_invent_a_difficulty(app, monkeypatch):
+    monkeypatch.setattr(recipe, "generate_recipes", lambda *a, **k: fake_result(fake_recipe(difficulty=None)))
+    app.run()
+    button(app, "레시피 생성").click().run()
+    captions = " ".join(str(c.value) for c in app.caption)
+    assert "한식 · ⏱ 20분 · 2인분" in captions and "중급" not in captions

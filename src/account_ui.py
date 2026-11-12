@@ -32,6 +32,8 @@ CLEAR_KEYS = ("rows", "next_id", "confirmed", "run_info", "progress_log", "recog
 CLEAR_PREFIXES = ("name_", "qty_", "del_", "opt_", "memo_", "mr_", "recipe_", "save_", "profile_", "delete_")
 GOOGLE_KEYS = ("client_id", "client_secret", "redirect_uri", "cookie_secret", "server_metadata_url")
 BASE_DIETS = ["채식", "비건", "페스코"]
+# 레시피 조건을 메뉴를 오가도 기억해 두는 곳(app.py 가 쓴다). opt_ 로 시작하므로 로그아웃 때 함께 지워진다.
+OPTION_STORE = "opt_saved"
 
 
 def kst(when):
@@ -247,6 +249,12 @@ def login_page(repo, repo_error):
         st.error(f"❌ {st.session_state['auth_error']}")
     st.divider()
     if google_configured():
+        # 구글 로그인은 구글 화면에 다녀오며 새 화면으로 시작하므로, 지금 화면에만 있는 재료·레시피·저장 대기가 이어지지 않는다.
+        # 누르기 전에 알려서, 만든 레시피가 말없이 사라졌다고 느끼지 않게 한다.
+        ss = st.session_state
+        if any(k in ss for k in ("pending_save", "recipe_result", "confirmed", "rows")):
+            st.warning("구글 로그인은 구글 화면에 다녀오기 때문에 지금 화면의 재료와 레시피가 사라질 수 있어요. "
+                       "저장하려던 레시피는 로그인한 뒤 다시 만들어 저장해 주세요.")
         st.button("🔐 구글로 로그인", on_click=start_google_login, key="google_btn")
         st.caption("구글 계정으로 처음 로그인하면 계정이 자동으로 만들어져요.")
     else:
@@ -284,7 +292,7 @@ def save_recipe_now(index):
 
 def request_login_to_save(index):
     st.session_state.update(pending_save=index, menu=MENU_LOGIN,
-                            auth_notice="레시피를 저장하려면 먼저 로그인해 주세요. 로그인하면 바로 저장해 드려요.")
+                            auth_notice="레시피를 저장하려면 먼저 로그인해 주세요. 아이디·비밀번호로 로그인하면 바로 이어서 저장해 드려요.")
 
 
 def apply_pending_save(user):
@@ -423,8 +431,10 @@ def save_profile():
         return
     if updated:
         ss["user"] = updated
+        store = (ss.get(OPTION_STORE) or {}).get("values", {})
         for key in ("opt_servings", "opt_allergies", "opt_diet"):  # 레시피 조건의 기본값을 새 프로필로 다시 채운다
             ss.pop(key, None)
+            store.pop(key, None)  # 기억해 둔 이전 값이 새 프로필 값을 덮지 않게 한다
         ss["profile_notice"] = ("success", "프로필을 저장했어요. 다음 레시피 추천부터 기본 조건으로 쓰여요.")
 
 
@@ -443,8 +453,10 @@ def delete_account():
     try:
         if user["provider"] == "password":
             cred = repo.get_credentials(user["email"])
-            if not cred or not auth.verify_password(cred["password_hash"], ss.get("delete_password", "")):
-                ss["delete_error"] = "비밀번호가 올바르지 않아요."
+            password = ss.get("delete_password", "")
+            ss["delete_password"] = ""  # 틀렸어도 비밀번호를 화면 상태에 남기지 않는다(로그인 칸과 같게)
+            if not cred or not auth.verify_password(cred["password_hash"], password):
+                ss["delete_error"] = "비밀번호가 올바르지 않아요. 다시 입력해 주세요."
                 return
         repo.delete_user(user["id"])
     except db.StorageError as e:

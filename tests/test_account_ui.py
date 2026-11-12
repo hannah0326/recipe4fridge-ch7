@@ -596,3 +596,64 @@ def test_edited_ingredients_survive_switching_menus(at):
     go(at, account_ui.MENU_MAIN)                                         # 돌아온다
     assert at.text_input(key="name_0").value == "유정란" and at.text_input(key="qty_1").value == "1팩"
     assert at.text_input(key="name_1").value == "우유"
+
+
+
+# --- 메뉴를 오가도 레시피 조건이 유지된다 -------------------------------------------------------
+def test_recipe_conditions_survive_a_trip_to_the_login_page(at):
+    at.session_state["confirmed"] = CONFIRMED
+    at.run()
+    at.multiselect(key="opt_allergies").set_value(["땅콩"]).run()
+    at.number_input(key="opt_servings").set_value(4).run()
+    at.slider(key="opt_count").set_value(2).run()
+    go(at, account_ui.MENU_LOGIN)                                        # 저장하려고 로그인 화면에 갔다가
+    go(at, account_ui.MENU_MAIN)                                         # 돌아온다
+    assert not at.exception
+    assert at.multiselect(key="opt_allergies").value == ["땅콩"]
+    assert at.number_input(key="opt_servings").value == 4 and at.slider(key="opt_count").value == 2
+
+
+def test_conditions_chosen_before_logging_in_are_kept_and_the_profile_allergies_are_added(at, memory_repo):
+    user = memory_repo.create_user("hannah@example.com", "password", "한나", password_hash=auth.hash_password(PW))
+    memory_repo.update_profile(user["id"], "한나", 3, ["채식"], ["우유"])
+    at.session_state["confirmed"] = CONFIRMED
+    at.run()
+    at.multiselect(key="opt_allergies").set_value(["땅콩"]).run()
+    go(at, account_ui.MENU_LOGIN)
+    at.text_input(key="login_email").set_value("hannah@example.com")
+    at.text_input(key="login_password").set_value(PW)
+    button(at, "로그인").click().run()
+    assert at.session_state["menu"] == account_ui.MENU_MAIN
+    assert at.multiselect(key="opt_allergies").value == ["땅콩", "우유"]     # 직접 넣은 값은 남고 프로필 값이 더해진다
+    assert at.multiselect(key="opt_diet").value == ["채식"]
+
+
+def test_logout_forgets_the_remembered_conditions(at, memory_repo):
+    login_user(at, memory_repo)
+    at.session_state["confirmed"] = CONFIRMED
+    at.run()
+    at.multiselect(key="opt_allergies").set_value(["땅콩"]).run()
+    button(at, "로그아웃").click().run()
+    assert account_ui.OPTION_STORE not in at.session_state
+
+
+# --- 구글 로그인 전 안내 ------------------------------------------------------------------------
+def test_google_login_warns_that_unsaved_work_may_be_lost(at, monkeypatch, memory_repo):
+    monkeypatch.setattr(account_ui, "google_configured", lambda: True)
+    go(at, account_ui.MENU_LOGIN)
+    assert not any("구글 화면에 다녀오기" in w.value for w in at.warning)   # 만든 것이 없으면 경고하지 않는다
+    go(at, account_ui.MENU_MAIN)
+    prepare_results(at)
+    button(at, "💾 저장 (로그인 필요)", key="save_0").click().run()
+    assert any("구글 화면에 다녀오기" in w.value for w in at.warning)
+    assert any("아이디·비밀번호로 로그인하면 바로 이어서 저장" in i.value for i in at.info)
+
+
+def test_wrong_password_on_account_deletion_is_cleared(at, memory_repo):
+    join(at)
+    go(at, account_ui.MENU_PROFILE)
+    at.text_input(key="delete_email").set_value("hannah@example.com")
+    at.text_input(key="delete_password").set_value("wrong-password*1")
+    button(at, "계정 삭제").click().run()
+    assert "비밀번호가 올바르지 않아요" in errors(at)
+    assert at.text_input(key="delete_password").value == ""          # 틀린 비밀번호를 화면 상태에 남기지 않는다

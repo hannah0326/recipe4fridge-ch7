@@ -422,3 +422,14 @@ def test_generate_marks_what_the_user_lacks_as_missing_even_if_model_said_have()
     res = gen(post, {"count": 1, "extra": "허용"})
     r = res["recipes"][0]
     assert r["missing"] == ["대파"] and [i["have"] for i in r["ingredients"]] == [True, False]
+
+
+
+def test_unknown_difficulty_is_not_filled_in_as_intermediate():
+    for given in (None, "", "보통아님", "expert"):
+        r = rc._clean_recipe(make(difficulty=given))
+        assert r is not None and r["difficulty"] is None             # 근거 없이 '중급'으로 채우지 않는다
+    unknown = rc._clean_recipe(make(difficulty=None))
+    assert check(unknown) is None                                    # 난이도를 고르지 않았으면 통과
+    reason = check(unknown, difficulty="medium")
+    assert reason and "밝히지 않아" in reason and "중급" in reason    # 골랐으면 확인할 수 없어 제외하고 이유를 알린다

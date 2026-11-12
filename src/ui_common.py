@@ -22,10 +22,12 @@ def unexpected_message(error):
 
 
 def recipe_caption(r):
-    """카드 위쪽 한 줄 요약(요리 종류 · 시간 · 난이도 · 인분 · 부족한 재료)."""
+    """카드 위쪽 한 줄 요약(요리 종류 · 시간 · 난이도 · 인분 · 부족한 재료). 모르는 요리 종류·난이도는 지어내지 않고 뺀다."""
     lack = "부족한 재료 없음" if not r.get("missing") else f"부족한 재료 {len(r['missing'])}개"
     kind = f"{r['cuisine']} · " if r.get("cuisine") else ""
-    return f"{kind}⏱ {r['time_minutes']}분 · {DIFFICULTY_LABEL.get(r.get('difficulty'), '중급')} · {r['servings']}인분 · {lack}"
+    level = DIFFICULTY_LABEL.get(r.get("difficulty"))
+    level = f"{level} · " if level else ""
+    return f"{kind}⏱ {r['time_minutes']}분 · {level}{r['servings']}인분 · {lack}"
 
 
 def render_recipe_summary(r):

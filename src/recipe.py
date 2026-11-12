@@ -234,7 +234,8 @@ def _clean_recipe(raw):
     if not ingredients:
         return None
     difficulty = str(raw.get("difficulty") or "").strip().lower()
-    difficulty = difficulty if difficulty in DIFFICULTIES else _DIFFICULTY_WORDS.get(difficulty, "medium")
+    # 모르는 값이나 빠진 값을 '중급'으로 채우지 않는다. 채우면 카드에 근거 없는 '중급'이 보이고 필터도 잘못 통과한다.
+    difficulty = difficulty if difficulty in DIFFICULTIES else _DIFFICULTY_WORDS.get(difficulty)
     return {
         "title": title,
         "summary": _clean_text(raw.get("summary"), 120),
@@ -336,6 +337,9 @@ def reject_reason(recipe, options, pantry_names):
     # 요리 종류는 모델이 cuisine 을 밝힌 경우에만 확인한다. 밝히지 않았으면 확인할 수 없어 통과시킨다.
     if options.get("cuisine") and recipe["cuisine"] and recipe["cuisine"] != options["cuisine"]:
         return f"요리 종류가 {recipe['cuisine']}이라 {options['cuisine']}이 아님"
+    # 난이도는 사용자가 고른 경우 모델이 밝히지 않았으면 맞는지 확인할 수 없으므로 제외한다(근거 없이 통과시키지 않는다).
+    if options.get("difficulty") and not recipe["difficulty"]:
+        return f"난이도를 밝히지 않아 {DIFFICULTY_KO[options['difficulty']]}인지 확인할 수 없음"
     if options.get("difficulty") and recipe["difficulty"] != options["difficulty"]:
         return f"난이도가 {DIFFICULTY_KO[recipe['difficulty']]}이라 {DIFFICULTY_KO[options['difficulty']]}이 아님"
     if options["extra"] == "불가" and recipe["missing"]:
